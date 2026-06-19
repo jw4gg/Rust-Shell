@@ -1,5 +1,5 @@
 [package]
-name = "rust-shell"
+name = "Rust-Shell"
 version = "0.1.1"
 authors = ["John Waggoner"]
 description = "A POSIX-style shell written in Rust: builtins, quoting/escaping, I/O redirection, and full programmable tab completion."
