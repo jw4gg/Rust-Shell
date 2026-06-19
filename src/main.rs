@@ -168,6 +168,8 @@ fn main() {
     let mut jobs: Vec<Job> = Vec::new();
 
     loop {
+        reap_jobs(&mut jobs, &mut io::stdout());
+
         let input = match rl.readline("$ ") {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) => continue,
@@ -246,15 +248,8 @@ fn main() {
                 let n = jobs.len();
                 let mut remaining = Vec::new();
                 for (i, mut job) in std::mem::take(&mut jobs).into_iter().enumerate() {
-                    let marker = if i + 1 == n {
-                        "+"
-                    } else if i + 2 == n {
-                        "-"
-                    } else {
-                        " "
-                    };
-                    let done = matches!(job.child.try_wait(), Ok(Some(_)));
-                    if done {
+                    let marker = job_marker(i, n);
+                    if matches!(job.child.try_wait(), Ok(Some(_))) {
                         writeln!(
                             out,
                             "[{}]{}  {:<24}{}",
@@ -342,14 +337,21 @@ fn main() {
                     if background {
                         match cmd.spawn() {
                             Ok(child) => {
-                                let number = jobs.last().map(|j| j.number + 1).unwrap_or(1);
+                                let number = next_job_number(&jobs);
                                 println!("[{}] {}", number, child.id());
-                                jobs.push(Job {
-                                    number,
-                                    child,
-                                    command: tokens.join(" "),
-                                    status: "Running".to_string(),
-                                });
+                                let pos = jobs
+                                    .iter()
+                                    .position(|j| j.number > number)
+                                    .unwrap_or(jobs.len());
+                                jobs.insert(
+                                    pos,
+                                    Job {
+                                        number,
+                                        child,
+                                        command: tokens.join(" "),
+                                        status: "Running".to_string(),
+                                    },
+                                );
                             }
                             Err(e) => eprintln!("{}: failed to execute: {}", name, e),
                         }
@@ -418,6 +420,45 @@ struct Job {
     child: process::Child,
     command: String,
     status: String,
+}
+
+fn next_job_number(jobs: &[Job]) -> u32 {
+    let mut n = 1;
+    while jobs.iter().any(|j| j.number == n) {
+        n += 1;
+    }
+    n
+}
+
+fn job_marker(i: usize, n: usize) -> &'static str {
+    if i + 1 == n {
+        "+"
+    } else if i + 2 == n {
+        "-"
+    } else {
+        " "
+    }
+}
+
+fn reap_jobs(jobs: &mut Vec<Job>, out: &mut dyn Write) {
+    let n = jobs.len();
+    let mut remaining = Vec::new();
+    for (i, mut job) in std::mem::take(jobs).into_iter().enumerate() {
+        if matches!(job.child.try_wait(), Ok(Some(_))) {
+            writeln!(
+                out,
+                "[{}]{}  {:<24}{}",
+                job.number,
+                job_marker(i, n),
+                "Done",
+                job.command
+            )
+            .unwrap();
+        } else {
+            remaining.push(job);
+        }
+    }
+    *jobs = remaining;
 }
 
 struct Redirect {
