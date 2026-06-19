@@ -9,8 +9,9 @@ permissions:
   contents: write
 
 jobs:
-  publish:
-    name: Build and Release
+  # Job 1: Build on all OS platforms in parallel
+  build:
+    name: Build Binaries
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -27,7 +28,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact_name: Rust-Shell.exe
             asset_name: Rust-Shell-windows-amd64.exe
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -40,12 +40,30 @@ jobs:
     - name: Build Binary (Release Mode)
       run: cargo build --release --target ${{ matrix.target }}
 
-    - name: Package Assets
+    - name: Rename Asset
       shell: bash
       run: |
         mkdir dist
-        # Copy the compiled binary from the target folder to our distribution folder
         cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} dist/${{ matrix.asset_name }}
+
+    # Temporarily save the binary inside the workflow run
+    - name: Upload intermediate artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.asset_name }}
+        path: dist/${{ matrix.asset_name }}
+
+  # Job 2: Run ONCE to collect everything and make one single GitHub Release
+  publish:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download all built binaries
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+        merge-multiple: true
 
     - name: Upload to GitHub Release
       uses: softprops/action-gh-release@v2
