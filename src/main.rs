@@ -165,6 +165,8 @@ fn main() {
         completions: Rc::clone(&completions),
     }));
 
+    let mut jobs: Vec<Job> = Vec::new();
+
     loop {
         let input = match rl.readline("$ ") {
             Ok(line) => line,
@@ -177,9 +179,13 @@ fn main() {
             continue;
         }
 
-        let all_tokens = tokenize(&input);
+        let mut all_tokens = tokenize(&input);
         if all_tokens.is_empty() {
             continue;
+        }
+        let background = all_tokens.last().map(|s| s.as_str()) == Some("&");
+        if background {
+            all_tokens.pop();
         }
         let (tokens, stdout_file, stderr_file) = split_redirect(all_tokens);
         if tokens.is_empty() {
@@ -236,7 +242,37 @@ fn main() {
                     writeln!(err, "cd: {}: No such file or directory", arg).unwrap();
                 }
             }
-            "jobs" => {}
+            "jobs" => {
+                let n = jobs.len();
+                let mut remaining = Vec::new();
+                for (i, mut job) in std::mem::take(&mut jobs).into_iter().enumerate() {
+                    let marker = if i + 1 == n {
+                        "+"
+                    } else if i + 2 == n {
+                        "-"
+                    } else {
+                        " "
+                    };
+                    let done = matches!(job.child.try_wait(), Ok(Some(_)));
+                    if done {
+                        writeln!(
+                            out,
+                            "[{}]{}  {:<24}{}",
+                            job.number, marker, "Done", job.command
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(
+                            out,
+                            "[{}]{}  {:<24}{} &",
+                            job.number, marker, job.status, job.command
+                        )
+                        .unwrap();
+                        remaining.push(job);
+                    }
+                }
+                jobs = remaining;
+            }
             "complete" => match args.first().map(|s| s.as_str()) {
                 Some("-C") => {
                     if let (Some(path), Some(cmd)) = (args.get(1), args.get(2)) {
@@ -303,7 +339,21 @@ fn main() {
                             }
                         }
                     }
-                    if let Err(e) = cmd.status() {
+                    if background {
+                        match cmd.spawn() {
+                            Ok(child) => {
+                                let number = jobs.last().map(|j| j.number + 1).unwrap_or(1);
+                                println!("[{}] {}", number, child.id());
+                                jobs.push(Job {
+                                    number,
+                                    child,
+                                    command: tokens.join(" "),
+                                    status: "Running".to_string(),
+                                });
+                            }
+                            Err(e) => eprintln!("{}: failed to execute: {}", name, e),
+                        }
+                    } else if let Err(e) = cmd.status() {
                         eprintln!("{}: failed to execute: {}", name, e);
                     }
                 }
@@ -361,6 +411,13 @@ fn tokenize(input: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+struct Job {
+    number: u32,
+    child: process::Child,
+    command: String,
+    status: String,
 }
 
 struct Redirect {
