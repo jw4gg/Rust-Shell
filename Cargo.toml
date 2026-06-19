@@ -1,0 +1,13 @@
+[package]
+name = "rust-shell"
+version = "0.1.0"
+authors = ["John Waggoner"]
+description = "A POSIX-style shell written in Rust: builtins, quoting/escaping, I/O redirection, and full programmable tab completion."
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+anyhow = "1.0.68"                                # error handling
+bytes = "1.3.0"                                  # helps manage buffers
+thiserror = "1.0.38"                             # error handling
+rustyline = "14.0.0"                             # line editing + tab completion
