@@ -2,7 +2,8 @@
 use std::env;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process;
@@ -111,7 +112,7 @@ fn complete_command(prefix: &str) -> Vec<Pair> {
                     continue;
                 }
                 if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                    if is_executable(&meta) {
                         matches.push(Pair {
                             display: fname.to_string(),
                             replacement: format!("{} ", fname),
@@ -183,6 +184,10 @@ fn main() {
 
         let mut all_tokens = tokenize(&input);
         if all_tokens.is_empty() {
+            continue;
+        }
+        if all_tokens.iter().any(|t| t == "|") {
+            run_pipeline(all_tokens);
             continue;
         }
         let background = all_tokens.last().map(|s| s.as_str()) == Some("&");
@@ -422,6 +427,109 @@ struct Job {
     status: String,
 }
 
+fn pipeline_builtin(name: &str) -> bool {
+    matches!(name, "echo" | "pwd" | "type")
+}
+
+fn run_builtin_in_pipeline(
+    seg: Vec<String>,
+    stdin: Option<io::PipeReader>,
+    stdout: Option<io::PipeWriter>,
+) {
+    if let Some(mut r) = stdin {
+        let mut sink = Vec::new();
+        let _ = r.read_to_end(&mut sink);
+    }
+    let mut out: Box<dyn Write> = match stdout {
+        Some(w) => Box::new(w),
+        None => Box::new(io::stdout()),
+    };
+    let name = seg[0].as_str();
+    let args = &seg[1..];
+    match name {
+        "echo" => {
+            let _ = writeln!(out, "{}", args.join(" "));
+        }
+        "pwd" => {
+            if let Ok(cwd) = env::current_dir() {
+                let _ = writeln!(out, "{}", cwd.display());
+            }
+        }
+        "type" => {
+            let target = args.first().map(|s| s.as_str()).unwrap_or("");
+            match target {
+                "echo" | "exit" | "type" | "pwd" | "cd" | "complete" | "jobs" => {
+                    let _ = writeln!(out, "{} is a shell builtin", target);
+                }
+                _ => match find_in_path(target) {
+                    Some(p) => {
+                        let _ = writeln!(out, "{} is {}", target, p.display());
+                    }
+                    None => {
+                        let _ = writeln!(out, "{}: not found", target);
+                    }
+                },
+            }
+        }
+        _ => {}
+    }
+}
+
+fn run_pipeline(all_tokens: Vec<String>) {
+    let segments: Vec<Vec<String>> = all_tokens
+        .split(|t| t == "|")
+        .map(|s| s.to_vec())
+        .collect();
+    let n = segments.len();
+    if segments.iter().any(|s| s.is_empty()) {
+        eprintln!("syntax error near `|'");
+        return;
+    }
+
+    let mut readers: Vec<Option<io::PipeReader>> = Vec::with_capacity(n);
+    let mut writers: Vec<Option<io::PipeWriter>> = Vec::with_capacity(n);
+    readers.push(None);
+    for _ in 0..n - 1 {
+        let (r, w) = io::pipe().expect("failed to create pipe");
+        writers.push(Some(w));
+        readers.push(Some(r));
+    }
+    writers.push(None);
+
+    let mut children = Vec::new();
+    let mut threads = Vec::new();
+
+    for (i, seg) in segments.into_iter().enumerate() {
+        let stdin = readers[i].take();
+        let stdout = writers[i].take();
+        if pipeline_builtin(&seg[0]) {
+            threads.push(std::thread::spawn(move || {
+                run_builtin_in_pipeline(seg, stdin, stdout);
+            }));
+        } else {
+            let mut cmd = process::Command::new(&seg[0]);
+            cmd.args(&seg[1..]);
+            if let Some(r) = stdin {
+                cmd.stdin(process::Stdio::from(r));
+            }
+            if let Some(w) = stdout {
+                cmd.stdout(process::Stdio::from(w));
+            }
+            match cmd.spawn() {
+                Ok(child) => children.push(child),
+                Err(_) => eprintln!("{}: command not found", seg[0]),
+            }
+        }
+    }
+
+    for mut child in children {
+        let _ = child.wait();
+    }
+    for t in threads {
+        let _ = t.join();
+    }
+}
+
 fn next_job_number(jobs: &[Job]) -> u32 {
     let mut n = 1;
     while jobs.iter().any(|j| j.number == n) {
@@ -492,12 +600,23 @@ fn split_redirect(tokens: Vec<String>) -> (Vec<String>, Option<Redirect>, Option
     (args, stdout_file, stderr_file)
 }
 
+fn is_executable(meta: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     for dir in env::split_paths(&path) {
         let candidate = dir.join(name);
         if let Ok(meta) = fs::metadata(&candidate) {
-            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+            if is_executable(&meta) {
                 return Some(candidate);
             }
         }
