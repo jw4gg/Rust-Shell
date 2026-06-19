@@ -1,6 +1,6 @@
 [package]
 name = "Rust-Shell"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["John Waggoner"]
 description = "A POSIX-style shell written in Rust: builtins, quoting/escaping, I/O redirection, and full programmable tab completion."
 edition = "2024"

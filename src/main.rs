@@ -167,6 +167,20 @@ fn main() {
     }));
 
     let mut jobs: Vec<Job> = Vec::new();
+    let mut variables: HashMap<String, String> = HashMap::new();
+    let histfile = env::var("HISTFILE").ok();
+    let mut history: Vec<String> = Vec::new();
+    let mut last_append: usize = 0;
+
+    if let Some(ref hf) = histfile {
+        if let Ok(content) = fs::read_to_string(hf) {
+            for line in content.lines() {
+                history.push(line.to_string());
+                let _ = rl.add_history_entry(line);
+            }
+        }
+        last_append = history.len();
+    }
 
     loop {
         reap_jobs(&mut jobs, &mut io::stdout());
@@ -182,7 +196,10 @@ fn main() {
             continue;
         }
 
-        let mut all_tokens = tokenize(&input);
+        history.push(input.clone());
+        let _ = rl.add_history_entry(input.as_str());
+
+        let mut all_tokens = tokenize(&input, &variables);
         if all_tokens.is_empty() {
             continue;
         }
@@ -203,7 +220,7 @@ fn main() {
 
         let is_builtin = matches!(
             name,
-            "exit" | "echo" | "pwd" | "cd" | "type" | "complete" | "jobs"
+            "exit" | "echo" | "pwd" | "cd" | "type" | "complete" | "jobs" | "history" | "declare"
         );
         let mut out: Box<dyn Write> = match &stdout_file {
             Some(r) if is_builtin => match open_redirect(r) {
@@ -229,6 +246,7 @@ fn main() {
         match name {
             "exit" => {
                 let code = args.first().and_then(|c| c.parse().ok()).unwrap_or(0);
+                save_histfile(&history);
                 process::exit(code);
             }
             "echo" => {
@@ -301,10 +319,88 @@ fn main() {
                 }
                 _ => {}
             },
+            "declare" => match args.first().map(|s| s.as_str()) {
+                Some("-p") => {
+                    if let Some(n) = args.get(1) {
+                        match variables.get(n) {
+                            Some(v) => writeln!(out, "declare -- {}=\"{}\"", n, v).unwrap(),
+                            None => writeln!(err, "declare: {}: not found", n).unwrap(),
+                        }
+                    }
+                }
+                Some(_) => {
+                    for a in args {
+                        if let Some(eq) = a.find('=') {
+                            let name = &a[..eq];
+                            let val = &a[eq + 1..];
+                            if is_valid_identifier(name) {
+                                variables.insert(name.to_string(), val.to_string());
+                            } else {
+                                writeln!(err, "declare: `{}': not a valid identifier", a).unwrap();
+                            }
+                        } else if is_valid_identifier(a) {
+                            variables.entry(a.clone()).or_default();
+                        } else {
+                            writeln!(err, "declare: `{}': not a valid identifier", a).unwrap();
+                        }
+                    }
+                }
+                None => {}
+            },
+            "history" => match args.first().map(|s| s.as_str()) {
+                Some("-r") => {
+                    if let Some(p) = args.get(1) {
+                        if let Ok(content) = fs::read_to_string(p) {
+                            for line in content.lines() {
+                                history.push(line.to_string());
+                                let _ = rl.add_history_entry(line);
+                            }
+                        }
+                    }
+                }
+                Some("-w") => {
+                    if let Some(p) = args.get(1) {
+                        let mut s = String::new();
+                        for h in &history {
+                            s.push_str(h);
+                            s.push('\n');
+                        }
+                        if let Err(e) = fs::write(p, s) {
+                            writeln!(err, "history: {}: {}", p, e).unwrap();
+                        }
+                    }
+                }
+                Some("-a") => {
+                    if let Some(p) = args.get(1) {
+                        match fs::OpenOptions::new().create(true).append(true).open(p) {
+                            Ok(mut f) => {
+                                for h in &history[last_append..] {
+                                    let _ = writeln!(f, "{}", h);
+                                }
+                                last_append = history.len();
+                            }
+                            Err(e) => writeln!(err, "history: {}: {}", p, e).unwrap(),
+                        }
+                    }
+                }
+                Some(n) if n.parse::<usize>().is_ok() => {
+                    let count = n.parse::<usize>().unwrap();
+                    let start = history.len().saturating_sub(count);
+                    for (i, h) in history.iter().enumerate().skip(start) {
+                        writeln!(out, "{:>5}  {}", i + 1, h).unwrap();
+                    }
+                }
+                _ => {
+                    for (i, h) in history.iter().enumerate() {
+                        writeln!(out, "{:>5}  {}", i + 1, h).unwrap();
+                    }
+                }
+            },
             "type" => {
                 let target = args.first().map(|s| s.as_str()).unwrap_or("");
                 match target {
-                    "echo" | "exit" | "type" | "pwd" | "cd" | "complete" | "jobs" => {
+                    "echo" | "exit" | "type" | "pwd" | "cd" | "complete" | "jobs" | "history"
+                    | "declare" => {
                         writeln!(out, "{} is a shell builtin", target).unwrap();
                     }
                     _ => match find_in_path(target) {
@@ -368,9 +464,11 @@ fn main() {
             },
         }
     }
+
+    save_histfile(&history);
 }
 
-fn tokenize(input: &str) -> Vec<String> {
+fn tokenize(input: &str, variables: &HashMap<String, String>) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut started = false;
@@ -390,8 +488,14 @@ fn tokenize(input: &str) -> Vec<String> {
                 in_double = false;
             } else if c == '\\' && matches!(chars.peek(), Some('"' | '\\' | '$' | '`')) {
                 current.push(chars.next().unwrap());
+            } else if c == '$' {
+                expand_var(&mut chars, &mut current, variables);
             } else {
                 current.push(c);
+            }
+        } else if c == '$' {
+            if expand_var(&mut chars, &mut current, variables) {
+                started = true;
             }
         } else if c == '\\' {
             if let Some(next) = chars.next() {
@@ -418,6 +522,67 @@ fn tokenize(input: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+fn expand_var(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    current: &mut String,
+    variables: &HashMap<String, String>,
+) -> bool {
+    // '$' already consumed. Returns true if it appended non-empty text
+    // (drives the empty-word drop in unquoted context).
+    let name = if chars.peek() == Some(&'{') {
+        chars.next();
+        let mut n = String::new();
+        while let Some(&c) = chars.peek() {
+            if c == '}' {
+                chars.next();
+                break;
+            }
+            n.push(c);
+            chars.next();
+        }
+        n
+    } else {
+        let mut n = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_alphanumeric() || c == '_' {
+                n.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        n
+    };
+    if name.is_empty() {
+        current.push('$'); // bare '$' is literal
+        return true;
+    }
+    match variables.get(&name) {
+        Some(v) if !v.is_empty() => {
+            current.push_str(v);
+            true
+        }
+        _ => false, // unset/empty -> nothing
+    }
+}
+
+fn is_valid_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn save_histfile(history: &[String]) {
+    if let Ok(hf) = env::var("HISTFILE") {
+        let mut s = String::new();
+        for h in history {
+            s.push_str(h);
+            s.push('\n');
+        }
+        let _ = fs::write(hf, s);
+    }
 }
 
 struct Job {
@@ -458,7 +623,8 @@ fn run_builtin_in_pipeline(
         "type" => {
             let target = args.first().map(|s| s.as_str()).unwrap_or("");
             match target {
-                "echo" | "exit" | "type" | "pwd" | "cd" | "complete" | "jobs" => {
+                "echo" | "exit" | "type" | "pwd" | "cd" | "complete" | "jobs" | "history"
+                | "declare" => {
                     let _ = writeln!(out, "{} is a shell builtin", target);
                 }
                 _ => match find_in_path(target) {
